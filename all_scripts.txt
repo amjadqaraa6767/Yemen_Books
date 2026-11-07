@@ -1,0 +1,2056 @@
+
+
+================================================================================
+FILE: extract_pages.py
+================================================================================
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import json
+import re
+import statistics
+from pathlib import Path
+
+from bs4 import BeautifulSoup
+
+
+# =====================================================
+# المسارات
+# =====================================================
+
+BASE = Path("volume_01")
+
+EXTRACTED = BASE / "extracted"
+PAGES_DIR = EXTRACTED / "pages"
+
+HOCR_FILE = (
+    EXTRACTED /
+    "معجم البلدان والقبائل اليمنية المجلد 1_hocr.html"
+)
+
+INDEX_FILE = (
+    EXTRACTED /
+    "معجم البلدان والقبائل اليمنية المجلد 1_hocr_pageindex.json"
+)
+
+NUMBERS_FILE = (
+    EXTRACTED /
+    "معجم البلدان والقبائل اليمنية المجلد 1_page_numbers.json"
+)
+
+# الكلمات التي تقل ثقتها عن هذا الرقم توضع للمراجعة فقط
+LOW_CONFIDENCE_THRESHOLD = 70
+
+
+# =====================================================
+# قراءة البيانات
+# =====================================================
+
+def load_json(path):
+
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def clean_text(text):
+
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# =====================================================
+# استخراج الكلمات من سطر OCR
+# =====================================================
+
+def extract_line(line_element):
+
+    words = []
+
+    word_elements = line_element.find_all(
+        "span",
+        class_="ocrx_word"
+    )
+
+    for element in word_elements:
+
+        word = clean_text(element.get_text("", strip=True))
+
+        if not word:
+            continue
+
+        title = element.get("title", "")
+
+        confidence_match = re.search(
+            r"x_wconf\s+(\d+)",
+            title
+        )
+
+        confidence = (
+            int(confidence_match.group(1))
+            if confidence_match
+            else None
+        )
+
+        words.append({
+            "text": word,
+            "confidence": confidence
+        })
+
+    return words
+
+
+# =====================================================
+# استخراج صفحة واحدة
+# =====================================================
+
+def extract_page(page_number, record, hocr_bytes, page_number_data):
+
+    text_start, text_end, byte_start, byte_end = record
+
+    # التحقق من حدود البيانات
+    if not (0 <= byte_start < byte_end <= len(hocr_bytes)):
+        raise ValueError(
+            f"حدود غير صحيحة في الصفحة {page_number}"
+        )
+
+    # استخراج مقطع الصفحة باستخدام إزاحات البايتات
+    page_bytes = hocr_bytes[byte_start:byte_end]
+
+    page_html = page_bytes.decode(
+        "utf-8",
+        errors="replace"
+    )
+
+    soup = BeautifulSoup(
+        page_html,
+        "html.parser"
+    )
+
+    page_element = soup.find(
+        "div",
+        class_="ocr_page"
+    )
+
+    if page_element is None:
+
+        raise ValueError(
+            f"لم يتم العثور على عنصر ocr_page في الصفحة {page_number}"
+        )
+
+    page_id = page_element.get("id")
+
+    # معلومات الصفحة المطبوعة
+    printed_number = page_number_data.get(
+        page_number,
+        {}
+    ).get("pageNumber", "")
+
+    # استخراج الأسطر
+    line_elements = page_element.find_all(
+        class_="ocr_line"
+    )
+
+    lines = []
+    all_words = []
+
+    for line_index, line_element in enumerate(line_elements):
+
+        words = extract_line(line_element)
+
+        if not words:
+            continue
+
+        line_text = " ".join(
+            word["text"] for word in words
+        )
+
+        lines.append({
+            "line_number": line_index,
+            "text": line_text,
+            "words": words
+        })
+
+        all_words.extend(words)
+
+    # احتياط: إذا لم توجد وسوم ocr_line
+    if not lines:
+
+        words = extract_line(page_element)
+
+        if words:
+
+            all_words = words
+
+            lines.append({
+                "line_number": 0,
+                "text": " ".join(
+                    word["text"] for word in words
+                ),
+                "words": words
+            })
+
+    page_text = "\n".join(
+        line["text"] for line in lines
+    )
+
+    # حساب الثقة
+    confidences = [
+        word["confidence"]
+        for word in all_words
+        if word["confidence"] is not None
+    ]
+
+    average_confidence = (
+        round(statistics.mean(confidences), 2)
+        if confidences
+        else None
+    )
+
+    low_confidence_words = [
+        word
+        for word in all_words
+        if (
+            word["confidence"] is not None
+            and word["confidence"] < LOW_CONFIDENCE_THRESHOLD
+        )
+    ]
+
+    result = {
+        "leaf_number": page_number,
+
+        "page_id": page_id,
+
+        "printed_page_number": printed_number,
+
+        "source": {
+            "file": HOCR_FILE.name,
+            "byte_start": byte_start,
+            "byte_end": byte_end,
+            "text_index_start": text_start,
+            "text_index_end": text_end
+        },
+
+        "statistics": {
+            "line_count": len(lines),
+            "word_count": len(all_words),
+            "average_word_confidence": average_confidence,
+            "low_confidence_word_count": len(
+                low_confidence_words
+            )
+        },
+
+        "text": page_text,
+
+        "lines": lines,
+
+        "low_confidence_words": low_confidence_words
+    }
+
+    return result
+
+
+# =====================================================
+# البرنامج الرئيسي
+# =====================================================
+
+def main():
+
+    print("=" * 65)
+    print("استخراج صفحات HOCR")
+    print("=" * 65)
+
+    PAGES_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    print("\n[1] قراءة الملفات...")
+
+    index = load_json(INDEX_FILE)
+
+    number_data = load_json(NUMBERS_FILE)
+
+    # تحويل أرقام الصفحات إلى قاموس
+    page_numbers = {
+        item["leafNum"]: item
+        for item in number_data.get("pages", [])
+    }
+
+    # قراءة الملف بصيغة bytes
+    hocr_bytes = HOCR_FILE.read_bytes()
+
+    print("حجم HOCR بالبايت:", len(hocr_bytes))
+    print("عدد سجلات Page Index:", len(index))
+
+    # التحقق من آخر إزاحة
+    final_offset = index[-1][3]
+
+    print("آخر إزاحة في Page Index:", final_offset)
+
+    if final_offset > len(hocr_bytes):
+
+        raise ValueError(
+            "إزاحات Page Index تتجاوز حجم ملف HOCR"
+        )
+
+    if final_offset != len(hocr_bytes):
+
+        print(
+            "تنبيه: نهاية آخر صفحة لا تساوي حجم ملف HOCR."
+        )
+
+        print(
+            "الفرق:",
+            len(hocr_bytes) - final_offset
+        )
+
+    print("\n[2] اختبار بداية أول صفحة...")
+
+    first_start = index[0][2]
+
+    first_sample = hocr_bytes[
+        first_start:first_start + 300
+    ]
+
+    print(
+        first_sample.decode(
+            "utf-8",
+            errors="replace"
+        )[:200]
+    )
+
+    if b'ocr_page' not in first_sample:
+
+        raise ValueError(
+            "لم يتم العثور على بداية صفحة HOCR في الإزاحة الأولى"
+        )
+
+    print("\n[3] استخراج الصفحات...")
+
+    jsonl_path = EXTRACTED / "pages.jsonl"
+    txt_path = EXTRACTED / "pages.txt"
+
+    report = {
+        "total_pages_in_index": len(index),
+        "successful_pages": 0,
+        "failed_pages": [],
+        "total_words": 0,
+        "total_lines": 0,
+        "pages_with_printed_numbers": 0,
+        "pages_with_low_confidence_words": 0
+    }
+
+    with (
+        open(jsonl_path, "w", encoding="utf-8") as jsonl,
+        open(txt_path, "w", encoding="utf-8") as txt
+    ):
+
+        for page_number, record in enumerate(index):
+
+            try:
+
+                page = extract_page(
+                    page_number,
+                    record,
+                    hocr_bytes,
+                    page_numbers
+                )
+
+                filename = (
+                    f"page_{page_number:04d}.json"
+                )
+
+                page_path = PAGES_DIR / filename
+
+                with open(
+                    page_path,
+                    "w",
+                    encoding="utf-8"
+                ) as f:
+
+                    json.dump(
+                        page,
+                        f,
+                        ensure_ascii=False,
+                        indent=2
+                    )
+
+                # نسخة JSONL
+                jsonl.write(
+                    json.dumps(
+                        page,
+                        ensure_ascii=False
+                    ) + "\n"
+                )
+
+                # نسخة TXT مرتبة
+                txt.write(
+                    f"\n{'=' * 50}\n"
+                )
+
+                txt.write(
+                    f"الورقة التسلسلية: {page_number}\n"
+                )
+
+                txt.write(
+                    f"رقم الصفحة المطبوع: "
+                    f"{page['printed_page_number']}\n"
+                )
+
+                txt.write(
+                    f"{'=' * 50}\n"
+                )
+
+                txt.write(page["text"])
+                txt.write("\n")
+
+                # الإحصائيات
+                stats = page["statistics"]
+
+                report["successful_pages"] += 1
+
+                report["total_words"] += stats["word_count"]
+
+                report["total_lines"] += stats["line_count"]
+
+                if page["printed_page_number"]:
+                    report["pages_with_printed_numbers"] += 1
+
+                if stats["low_confidence_word_count"]:
+                    report["pages_with_low_confidence_words"] += 1
+
+                if (page_number + 1) % 50 == 0:
+
+                    print(
+                        f"تم استخراج {page_number + 1} صفحة"
+                    )
+
+            except Exception as error:
+
+                print(
+                    f"[خطأ] الصفحة {page_number}: {error}"
+                )
+
+                report["failed_pages"].append({
+                    "page": page_number,
+                    "error": str(error)
+                })
+
+    # حفظ التقرير
+    report_path = EXTRACTED / "extraction_report.json"
+
+    with open(
+        report_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            report,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    print("\n" + "=" * 65)
+    print("اكتمل استخراج الصفحات")
+    print("=" * 65)
+
+    print(
+        "الصفحات الناجحة:",
+        report["successful_pages"]
+    )
+
+    print(
+        "الصفحات الفاشلة:",
+        len(report["failed_pages"])
+    )
+
+    print(
+        "إجمالي الكلمات:",
+        report["total_words"]
+    )
+
+    print(
+        "إجمالي الأسطر:",
+        report["total_lines"]
+    )
+
+    print(
+        "صفحات لها أرقام مطبوعة:",
+        report["pages_with_printed_numbers"]
+    )
+
+    print("\nالنتائج:")
+    print(PAGES_DIR)
+    print(jsonl_path)
+    print(txt_path)
+    print(report_path)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+================================================================================
+FILE: enrich_pages.py
+================================================================================
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import json
+from pathlib import Path
+
+BASE = Path("volume_01/extracted")
+
+PAGES_DIR = BASE / "pages"
+OUTPUT_DIR = BASE / "pages_enriched"
+
+INDEX_FILE = BASE / "معجم البلدان والقبائل اليمنية المجلد 1_hocr_pageindex.json"
+SEARCH_FILE = BASE / "معجم البلدان والقبائل اليمنية المجلد 1_hocr_searchtext.txt"
+
+JSONL_OUTPUT = BASE / "pages_enriched.jsonl"
+TEXT_OUTPUT = BASE / "pages_enriched.txt"
+
+def load_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def main():
+
+    print("=" * 65)
+    print("ربط صفحات HOCR بنص Search Text")
+    print("=" * 65)
+
+    index = load_json(INDEX_FILE)
+
+    # قراءة النص كاملاً دون تغيير أو تطبيع
+    search_text = SEARCH_FILE.read_text(encoding="utf-8")
+
+    if len(index) != 828:
+        raise ValueError(f"عدد سجلات الفهرس غير متوقع: {len(index)}")
+
+    if len(index) != len(list(PAGES_DIR.glob("page_*.json"))):
+        raise ValueError("عدد ملفات الصفحات لا يطابق عدد سجلات الفهرس")
+
+    print("عدد الصفحات:", len(index))
+    print("عدد محارف Search Text:", len(search_text))
+
+    # التحقق من اتصال الحدود وتسلسلها
+    if index[0][0] != 0:
+        raise ValueError("بداية الفهرس لا تساوي صفر")
+
+    for i, record in enumerate(index):
+        start, end = record[0], record[1]
+
+        if not (0 <= start <= end <= len(search_text)):
+            raise ValueError(f"حدود غير صحيحة في الصفحة {i}")
+
+        if i > 0 and start != index[i - 1][1]:
+            raise ValueError(f"فجوة أو تداخل قبل الصفحة {i}")
+
+    if index[-1][1] != len(search_text):
+        raise ValueError("نهاية الفهرس لا تطابق طول Search Text")
+
+    print("التحقق من الحدود: ناجح")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    empty_pages = []
+    total_chars = 0
+
+    with JSONL_OUTPUT.open("w", encoding="utf-8") as jsonl, \
+         TEXT_OUTPUT.open("w", encoding="utf-8") as txt:
+
+        for page_no, record in enumerate(index):
+
+            start, end = record[0], record[1]
+
+            source_file = PAGES_DIR / f"page_{page_no:04d}.json"
+
+            if not source_file.exists():
+                raise FileNotFoundError(source_file)
+
+            page = load_json(source_file)
+
+            if page["leaf_number"] != page_no:
+                raise ValueError(f"رقم الصفحة غير مطابق: {page_no}")
+
+            # استخراج النص الموازي وفق إزاحات المحارف
+            parallel_text = search_text[start:end]
+
+            page["parallel_text"] = {
+                "source_file": SEARCH_FILE.name,
+                "offset_unit": "unicode_characters",
+                "start": start,
+                "end": end,
+                "character_count": len(parallel_text),
+                "text": parallel_text
+            }
+
+            output_file = OUTPUT_DIR / source_file.name
+
+            output_file.write_text(
+                json.dumps(page, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+
+            jsonl.write(
+                json.dumps(page, ensure_ascii=False) + "\n"
+            )
+
+            txt.write(
+                f"\n{'=' * 70}\n"
+                f"رقم الورقة: {page_no}\n"
+                f"HOCR: {page['page_id']}\n"
+                f"{'=' * 70}\n\n"
+                f"[HOCR]\n{page['text']}\n\n"
+                f"[SEARCH TEXT]\n{parallel_text}\n"
+            )
+
+            total_chars += len(parallel_text)
+
+            if not parallel_text.strip():
+                empty_pages.append(page_no)
+
+    print("\n" + "=" * 65)
+    print("اكتمل الربط بنجاح")
+    print("=" * 65)
+
+    print("الصفحات المعالجة:", len(index))
+    print("إجمالي المحارف المرتبطة:", total_chars)
+    print("الصفحات الفارغة:", len(empty_pages))
+    print("أرقام الصفحات الفارغة:", empty_pages)
+
+    print("\nالمخرجات:")
+    print("JSON:", OUTPUT_DIR)
+    print("JSONL:", JSONL_OUTPUT)
+    print("TXT:", TEXT_OUTPUT)
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+FILE: compare_texts.py
+================================================================================
+
+import json
+from pathlib import Path
+from difflib import SequenceMatcher
+
+PAGES = Path("volume_01/extracted/pages_enriched")
+
+samples = [0, 1, 4, 10, 100, 400, 600, 824, 825, 826, 827]
+
+for number in samples:
+
+    path = PAGES / f"page_{number:04d}.json"
+
+    if not path.exists():
+        continue
+
+    page = json.loads(path.read_text(encoding="utf-8"))
+
+    hocr = page["text"]
+    search = page["parallel_text"]["text"]
+
+    matcher = SequenceMatcher(None, hocr, search)
+
+    print("\n" + "=" * 70)
+    print("الورقة:", number)
+    print("HOCR:", len(hocr), "محرف")
+    print("Search Text:", len(search), "محرف")
+    print("نسبة التشابه التقريبية:", round(matcher.ratio() * 100, 2), "%")
+
+    print("\n--- HOCR ---")
+    print(hocr[:1000])
+
+    print("\n--- SEARCH TEXT ---")
+    print(search[:1000])
+
+
+================================================================================
+FILE: convert_to_openiti.py
+================================================================================
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Convert enriched HOCR pages into OpenITI mARkdown.
+
+Input:
+    volume_01/extracted/pages_enriched/page_XXXX.json
+
+Output:
+    volume_01/openiti_output/
+        *.mARkdown
+        *.yml
+        page_map.csv
+        conversion_report.json
+
+Important:
+    - HOCR remains the primary text.
+    - Search Text is NOT merged into HOCR.
+    - No OCR correction or normalization is performed.
+    - Empty pages are preserved.
+    - Page markers represent sequential scanned leaves,
+      NOT verified printed page numbers.
+"""
+
+import json
+import csv
+import re
+import sys
+
+from pathlib import Path
+from datetime import date
+
+
+# ============================================================
+# 1. SETTINGS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+SOURCE_DIR = (
+    BASE_DIR
+    / "volume_01"
+    / "extracted"
+    / "pages_enriched"
+)
+
+OUTPUT_DIR = (
+    BASE_DIR
+    / "volume_01"
+    / "openiti_output"
+)
+
+# بيانات تعريف مؤقتة.
+# يجب تعديل اسم المؤلف ومعرّف OpenITI عند التحقق منهما.
+
+BOOK_TITLE = "معجم البلدان والقبائل اليمنية"
+
+AUTHOR_AR = "غير متحقق منه"
+
+# URI مؤقت، وليس معرّف OpenITI رسميّاً معتمداً.
+URI = (
+    "0000Unknown."
+    "MujamBuldanQabailYemen."
+    "IA20200711-ara1"
+)
+
+ARCHIVE_ID = "2_20200711_20200711_1634"
+
+ARCHIVE_URL = (
+    "https://archive.org/details/"
+    + ARCHIVE_ID
+)
+
+VOLUME_NUMBER = 1
+
+EXPECTED_PAGES = 828
+
+# ============================================================
+# 2. HELPERS
+# ============================================================
+
+
+def load_json(path):
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_text(path, content):
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+
+
+def count_words(text):
+    return len(re.findall(r"\S+", text))
+
+
+def get_page_files():
+    if not SOURCE_DIR.exists():
+        raise FileNotFoundError(
+            f"مجلد المصدر غير موجود:\n{SOURCE_DIR}"
+        )
+
+    files = list(SOURCE_DIR.glob("page_*.json"))
+
+    def page_number(path):
+        match = re.fullmatch(
+            r"page_(\d+)\.json",
+            path.name
+        )
+
+        if not match:
+            raise ValueError(
+                f"اسم ملف غير صالح: {path.name}"
+            )
+
+        return int(match.group(1))
+
+    return sorted(files, key=page_number)
+
+
+# ============================================================
+# 3. VALIDATE INPUT
+# ============================================================
+
+
+def validate_pages(files):
+
+    if len(files) != EXPECTED_PAGES:
+        raise ValueError(
+            f"عدد ملفات الصفحات غير صحيح: "
+            f"{len(files)}، المتوقع {EXPECTED_PAGES}"
+        )
+
+    pages = []
+
+    for expected_index, path in enumerate(files):
+
+        page = load_json(path)
+
+        leaf = page.get("leaf_number")
+
+        if leaf != expected_index:
+            raise ValueError(
+                f"اختلاف ترتيب الصفحات: {path.name}\n"
+                f"leaf_number = {leaf}\n"
+                f"المتوقع = {expected_index}"
+            )
+
+        if not isinstance(page.get("text"), str):
+            raise ValueError(
+                f"حقل text غير صالح في {path.name}"
+            )
+
+        if not isinstance(page.get("lines"), list):
+            raise ValueError(
+                f"حقل lines غير صالح في {path.name}"
+            )
+
+        pages.append(page)
+
+    return pages
+
+
+# ============================================================
+# 4. CONVERT ONE PAGE TO OPENITI
+# ============================================================
+
+
+def convert_page_text(text):
+
+    """
+    Convert HOCR page text into OpenITI paragraph lines.
+
+    Each original OCR line becomes an OpenITI paragraph.
+
+    No words are corrected, reordered, or normalized.
+    """
+
+    output = []
+
+    # فصل الأسطر دون تنظيف النص.
+    original_lines = text.split("\n")
+
+    for line in original_lines:
+
+        # إزالة CR فقط إذا كان جزءاً من نهاية CRLF.
+        if line.endswith("\r"):
+            line = line[:-1]
+
+        if line == "":
+            continue
+
+        # OpenITI paragraph marker.
+        output.append("# " + line)
+
+    return output
+
+
+# ============================================================
+# 5. BUILD OPENITI DOCUMENT
+# ============================================================
+
+
+def build_document(pages):
+
+    output = []
+
+    # OpenITI magic value.
+    output.append("######OpenITI#")
+
+    # Non-machine-readable metadata.
+    output.append(
+        f"#META#Title: {BOOK_TITLE}"
+    )
+
+    output.append(
+        f"#META#Author: {AUTHOR_AR}"
+    )
+
+    output.append(
+        "#META#Language: Arabic"
+    )
+
+    output.append(
+        "#META#Source: Internet Archive"
+    )
+
+    output.append(
+        f"#META#Source ID: {ARCHIVE_ID}"
+    )
+
+    output.append(
+        f"#META#Source URL: {ARCHIVE_URL}"
+    )
+
+    output.append(
+        "#META#Primary OCR: HOCR"
+    )
+
+    output.append(
+        "#META#Parallel OCR: Search Text, retained separately"
+    )
+
+    output.append(
+        "#META#Pagination: Sequential scanned leaves, "
+        "not verified printed pagination"
+    )
+
+    output.append(
+        "#META#Conversion: Automatic OCR-to-OpenITI conversion"
+    )
+
+    output.append(
+        "#META#Structural annotation: Not performed"
+    )
+
+    # End of metadata header.
+    output.append("#META#Header#End#")
+
+    total_characters = 0
+    total_words = 0
+    empty_pages = []
+
+    page_map = []
+
+    # --------------------------------------------------------
+    # Process pages in original order.
+    # --------------------------------------------------------
+
+    for index, page in enumerate(pages):
+
+        text = page["text"]
+
+        total_characters += len(text)
+        total_words += count_words(text)
+
+        if not text:
+            empty_pages.append(index)
+
+        # Convert text lines.
+        converted_lines = convert_page_text(text)
+
+        output.extend(converted_lines)
+
+        # Sequential OpenITI page marker.
+        page_number = index + 1
+
+        page_marker = (
+            f"PageV{VOLUME_NUMBER:02d}"
+            f"P{page_number:03d}"
+        )
+
+        output.append(page_marker)
+
+        # Keep page boundaries visible.
+        output.append("")
+
+        # Record original page information.
+        page_map.append({
+            "leaf_number": index,
+            "openiti_page": page_marker,
+            "printed_page_number": (
+                page.get("printed_page_number") or ""
+            ),
+            "hocr_characters": len(text),
+            "hocr_words": count_words(text),
+            "is_empty": not bool(text),
+        })
+
+    document = "\n".join(output)
+
+    # Ensure a final newline.
+    document += "\n"
+
+    statistics = {
+        "pages": len(pages),
+        "characters": total_characters,
+        "words": total_words,
+        "empty_pages": empty_pages,
+        "empty_page_count": len(empty_pages),
+    }
+
+    return document, page_map, statistics
+
+
+# ============================================================
+# 6. GENERATE VERSION YAML
+# ============================================================
+
+
+def build_yaml(statistics):
+
+    today = date.today().isoformat()
+
+    lines = [
+        f"00#VERS#CLENGTH##: {statistics['characters']}",
+        f"00#VERS#LENGTH###: {statistics['words']}",
+        f"00#VERS#URI######: {URI}",
+        f"80#VERS#LINKS####: {ARCHIVE_URL}",
+        f"90#VERS#DATE#####: {today}",
+        (
+            "90#VERS#COMMENT##: "
+            "Automatically converted from Internet Archive HOCR OCR. "
+            "The primary text is preserved without OCR correction. "
+            "Search Text remains a separate parallel transcription. "
+            "PageV01P markers represent sequential scanned leaves, "
+            "not verified printed page numbers. "
+            "Structural annotation has not been performed. "
+            "The author and URI require bibliographic verification."
+        ),
+    ]
+
+    return "\n".join(lines) + "\n"
+
+
+# ============================================================
+# 7. WRITE PAGE MAP CSV
+# ============================================================
+
+
+def write_page_map(path, page_map):
+
+    fieldnames = [
+        "leaf_number",
+        "openiti_page",
+        "printed_page_number",
+        "hocr_characters",
+        "hocr_words",
+        "is_empty",
+    ]
+
+    with path.open(
+        "w",
+        encoding="utf-8-sig",
+        newline=""
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames
+        )
+
+        writer.writeheader()
+        writer.writerows(page_map)
+
+
+# ============================================================
+# 8. VERIFY OUTPUT
+# ============================================================
+
+
+def verify_output(markdown_path, pages):
+
+    content = markdown_path.read_text(
+        encoding="utf-8"
+    )
+
+    lines = content.splitlines()
+
+    if not lines:
+        raise ValueError("ملف OpenITI فارغ")
+
+    if lines[0] != "######OpenITI#":
+        raise ValueError("قيمة OpenITI magic غير صحيحة")
+
+    if "#META#Header#End#" not in lines:
+        raise ValueError("فاصل البيانات الوصفية مفقود")
+
+    markers = re.findall(
+        r"^PageV01P\d{3}$",
+        content,
+        flags=re.MULTILINE
+    )
+
+    if len(markers) != len(pages):
+        raise ValueError(
+            f"عدد وسوم الصفحات غير صحيح: {len(markers)}"
+        )
+
+    expected_markers = [
+        f"PageV01P{i:03d}"
+        for i in range(1, len(pages) + 1)
+    ]
+
+    if markers != expected_markers:
+        raise ValueError(
+            "ترتيب وسوم الصفحات غير صحيح"
+        )
+
+    return {
+        "magic_value": True,
+        "metadata_separator": True,
+        "page_markers": len(markers),
+        "page_order": True,
+    }
+
+
+# ============================================================
+# 9. MAIN
+# ============================================================
+
+
+def main():
+
+    print("=" * 68)
+    print("تحويل بيانات HOCR إلى OpenITI mARkdown")
+    print("=" * 68)
+
+    print("\nالمصدر:")
+    print(SOURCE_DIR)
+
+    print("\nالمخرجات:")
+    print(OUTPUT_DIR)
+
+    # Create output directory.
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # Load and validate.
+    files = get_page_files()
+
+    print(f"\nملفات الصفحات المكتشفة: {len(files)}")
+
+    pages = validate_pages(files)
+
+    print("التحقق من ترتيب الصفحات: ناجح")
+
+    # Build OpenITI.
+    document, page_map, statistics = (
+        build_document(pages)
+    )
+
+    # Output paths.
+    markdown_path = (
+        OUTPUT_DIR
+        / f"{URI}.mARkdown"
+    )
+
+    yaml_path = (
+        OUTPUT_DIR
+        / f"{URI}.yml"
+    )
+
+    csv_path = (
+        OUTPUT_DIR
+        / "page_map.csv"
+    )
+
+    report_path = (
+        OUTPUT_DIR
+        / "conversion_report.json"
+    )
+
+    # Write files.
+    write_text(markdown_path, document)
+
+    write_text(
+        yaml_path,
+        build_yaml(statistics)
+    )
+
+    write_page_map(csv_path, page_map)
+
+    # Verify generated Markdown.
+    verification = verify_output(
+        markdown_path,
+        pages
+    )
+
+    # Report.
+    report = {
+        "format": "OpenITI mARkdown",
+        "uri": URI,
+        "title": BOOK_TITLE,
+        "author": AUTHOR_AR,
+        "source": ARCHIVE_URL,
+        "primary_text": "HOCR",
+        "parallel_text": "Search Text",
+        "parallel_text_merged": False,
+        "ocr_corrected": False,
+        "structural_annotation": False,
+        "page_numbering": (
+            "Sequential scanned leaves; "
+            "not verified printed page numbers"
+        ),
+        "statistics": statistics,
+        "verification": verification,
+        "outputs": {
+            "markdown": markdown_path.name,
+            "yaml": yaml_path.name,
+            "page_map": csv_path.name,
+        },
+    }
+
+    write_text(
+        report_path,
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            indent=2
+        )
+    )
+
+    # Final summary.
+    print("\n" + "=" * 68)
+    print("اكتمل التحويل بنجاح")
+    print("=" * 68)
+
+    print(f"الصفحات: {statistics['pages']}")
+    print(f"المحارف: {statistics['characters']}")
+    print(f"الكلمات: {statistics['words']}")
+
+    print(
+        f"الصفحات الفارغة: "
+        f"{statistics['empty_page_count']}"
+    )
+
+    print(
+        f"عدد وسوم الصفحات: "
+        f"{verification['page_markers']}"
+    )
+
+    print("\nالملفات الناتجة:")
+
+    print(f"mARkdown: {markdown_path}")
+    print(f"YAML:     {yaml_path}")
+    print(f"CSV:      {csv_path}")
+    print(f"Report:   {report_path}")
+
+    print("\nالتحقق النهائي: ناجح")
+
+    if statistics["empty_pages"]:
+        print(
+            "\nالأوراق الفارغة:"
+            f"\n{statistics['empty_pages']}"
+        )
+
+
+if __name__ == "__main__":
+
+    try:
+        main()
+
+    except Exception as exc:
+
+        print("\nحدث خطأ أثناء التحويل:")
+        print(str(exc))
+
+        sys.exit(1)
+
+
+================================================================================
+FILE: clean_openiti.py
+================================================================================
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+OpenITI Arabic OCR cleaning pipeline.
+
+Input:
+    volume_01/openiti_output/*.mARkdown
+
+Output:
+    volume_01/openiti_output/cleaned/
+        *.mARkdown
+        cleaning_changes.jsonl
+        cleaning_report.json
+
+Uses:
+    openiti.helper.ara.normalize_ara_light
+
+Preserves:
+    - Original source file
+    - OpenITI metadata
+    - Page markers
+    - Numeric information
+    - Paragraph order
+    - Empty pages
+    - OCR errors (no guessing or correction)
+
+Creates an audit record for every modified text line.
+"""
+
+import re
+import json
+import hashlib
+import shutil
+import sys
+
+from pathlib import Path
+from datetime import datetime, timezone
+
+from openiti.helper import ara
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+OPENITI_DIR = (
+    BASE_DIR
+    / "volume_01"
+    / "openiti_output"
+)
+
+OUTPUT_DIR = OPENITI_DIR / "cleaned"
+
+# Arabic normalization options.
+#
+# These options follow OpenITI normalize_ara_light.
+#
+# denoise_text:
+#     Remove tashkeel, shadda, tatweel and other noise.
+#
+# alif_seat:
+#     أ إ آ ٱ -> ا
+#
+# alif_maqsura:
+#     ى -> ي
+#
+# hamza:
+#     Normalize hamza on waw/ya carriers.
+#
+# per_to_ara:
+#     Convert Persian kaf/ya to Arabic kaf/ya.
+
+
+
+import inspect
+
+OPTIONS = {
+    "denoise_text": True,
+    "alif_seat": True,
+    "alif_maqsura": True,
+    "hamza": True,
+    "per_to_ara": True,
+}
+
+# مرّر فقط الخيارات التي تدعمها الدالة فعلاً
+_SUPPORTED = set(
+    inspect.signature(ara.normalize_ara_light).parameters
+)
+ACTIVE_OPTIONS = {
+    k: v for k, v in OPTIONS.items() if k in _SUPPORTED
+}
+
+
+# Preserve the original file.
+OVERWRITE = False
+
+# Include a maximum number of changed examples in report.
+MAX_EXAMPLES = 100
+
+# ============================================================
+# 2. HELPERS
+# ============================================================
+
+
+def sha256_text(text):
+
+    return hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
+
+
+def write_text(path, text):
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    with path.open(
+        "w",
+        encoding="utf-8",
+        newline=""
+    ) as f:
+
+        f.write(text)
+
+
+def write_json(path, data):
+
+    write_text(
+        path,
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2
+        )
+    )
+
+
+def is_page_marker(line):
+
+    return bool(
+        re.fullmatch(
+            r"Page(?:V\d+P\d+|Beg|End)",
+            line.strip()
+        )
+    )
+
+
+def is_metadata_line(line):
+
+    return line.startswith("#META#")
+
+
+def is_openiti_control_line(line):
+
+    """
+    Detect OpenITI structural lines that must not be normalized.
+    """
+
+    if not line:
+        return True
+
+    if line.startswith("######OpenITI#"):
+        return True
+
+    if is_metadata_line(line):
+        return True
+
+    if is_page_marker(line):
+        return True
+
+    # OpenITI structural tags.
+    if re.match(
+        r"^#{2,}\s*(?:\||\$|@|~|Page)",
+        line
+    ):
+        return True
+
+    return False
+
+
+# ============================================================
+# 3. CLEAN ONE TEXT LINE
+# ============================================================
+
+
+def clean_arabic_line(line):
+
+    """
+    Clean only the text content of an OpenITI paragraph.
+
+    Input:
+        # أَحْمَدُ بنُ يَحْيَى
+
+    Output:
+        # احمد بن يحيي
+
+    The OpenITI paragraph marker is retained.
+    """
+
+    if not line.startswith("# "):
+        return line
+
+    prefix = "# "
+    original_text = line[len(prefix):]
+    
+
+    cleaned_text = ara.normalize_ara_light(
+        original_text,
+        **ACTIVE_OPTIONS
+    )
+    
+
+    return prefix + cleaned_text
+
+
+# ============================================================
+# 4. CLEAN COMPLETE DOCUMENT
+# ============================================================
+
+
+def clean_document(original):
+
+    lines = original.splitlines(keepends=True)
+
+    cleaned_lines = []
+
+    changes = []
+
+    statistics = {
+        "total_lines": len(lines),
+        "text_lines": 0,
+        "changed_lines": 0,
+        "unchanged_lines": 0,
+        "metadata_lines": 0,
+        "page_markers": 0,
+        "empty_lines": 0,
+        "control_lines": 0,
+        "removed_characters": 0,
+    }
+
+    for line_number, raw_line in enumerate(lines, start=1):
+
+        # Preserve line ending.
+        if raw_line.endswith("\r\n"):
+            body = raw_line[:-2]
+            ending = "\r\n"
+
+        elif raw_line.endswith("\n"):
+            body = raw_line[:-1]
+            ending = "\n"
+
+        elif raw_line.endswith("\r"):
+            body = raw_line[:-1]
+            ending = "\r"
+
+        else:
+            body = raw_line
+            ending = ""
+
+        if not body:
+            statistics["empty_lines"] += 1
+            cleaned_lines.append(raw_line)
+            continue
+
+        if is_metadata_line(body):
+            statistics["metadata_lines"] += 1
+            cleaned_lines.append(raw_line)
+            continue
+
+        if is_page_marker(body):
+            statistics["page_markers"] += 1
+            cleaned_lines.append(raw_line)
+            continue
+
+        if is_openiti_control_line(body):
+            statistics["control_lines"] += 1
+            cleaned_lines.append(raw_line)
+            continue
+
+        if body.startswith("# "):
+
+            statistics["text_lines"] += 1
+
+            cleaned_body = clean_arabic_line(body)
+
+            if cleaned_body != body:
+
+                statistics["changed_lines"] += 1
+
+                statistics["removed_characters"] += (
+                    len(body) - len(cleaned_body)
+                )
+
+                changes.append({
+                    "line_number": line_number,
+                    "original": body,
+                    "cleaned": cleaned_body,
+                    "original_length": len(body),
+                    "cleaned_length": len(cleaned_body),
+                })
+
+            else:
+                statistics["unchanged_lines"] += 1
+
+            cleaned_lines.append(
+                cleaned_body + ending
+            )
+
+        else:
+
+            # Unknown non-paragraph lines are preserved.
+            statistics["control_lines"] += 1
+            cleaned_lines.append(raw_line)
+
+    return "".join(cleaned_lines), changes, statistics
+
+
+# ============================================================
+# 5. FIND INPUT FILE
+# ============================================================
+
+
+def find_input_file():
+
+    if not OPENITI_DIR.exists():
+        raise FileNotFoundError(
+            f"مجلد OpenITI غير موجود:\n{OPENITI_DIR}"
+        )
+
+    files = sorted(
+        OPENITI_DIR.glob("*.mARkdown")
+    )
+
+    if not files:
+        raise FileNotFoundError(
+            "لم يتم العثور على ملف mARkdown."
+        )
+
+    if len(files) > 1:
+
+        print("وجدت عدة ملفات:")
+
+        for i, path in enumerate(files):
+            print(f"{i}: {path.name}")
+
+        raise RuntimeError(
+            "ضع ملف الكتاب المطلوب وحده في المجلد "
+            "أو عدّل find_input_file لاختيار الملف."
+        )
+
+    return files[0]
+
+
+# ============================================================
+# 6. VALIDATE OPENITI DOCUMENT
+# ============================================================
+
+
+def validate_document(text):
+
+    lines = text.splitlines()
+
+    if not lines:
+        raise ValueError("الملف فارغ.")
+
+    if lines[0] != "######OpenITI#":
+        raise ValueError(
+            "قيمة OpenITI magic غير موجودة."
+        )
+
+    if "#META#Header#End#" not in lines:
+        raise ValueError(
+            "فاصل البيانات الوصفية غير موجود."
+        )
+
+    markers = [
+        line.strip()
+        for line in lines
+        if is_page_marker(line)
+    ]
+
+    return {
+        "valid_magic": True,
+        "valid_metadata_separator": True,
+        "page_markers": len(markers),
+        "first_page": markers[0] if markers else None,
+        "last_page": markers[-1] if markers else None,
+    }
+
+
+# ============================================================
+# 7. MAIN
+# ============================================================
+
+
+def main():
+
+    print("=" * 68)
+    print("تنظيف نص OpenITI باستخدام مكتبة OpenITI")
+    print("=" * 68)
+
+    source_path = find_input_file()
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    destination_path = (
+        OUTPUT_DIR / source_path.name
+    )
+
+    if destination_path.exists() and not OVERWRITE:
+
+        raise FileExistsError(
+            f"ملف التنظيف موجود مسبقاً:\n"
+            f"{destination_path}\n"
+            "غيّر اسمه أو راجع إعداد OVERWRITE."
+        )
+
+    print("\nملف المصدر:")
+    print(source_path)
+
+    original = source_path.read_text(
+        encoding="utf-8"
+    )
+
+    original_validation = validate_document(
+        original
+    )
+
+    print("\nالتحقق من الملف الأصلي: ناجح")
+
+    # --------------------------------------------------------
+    # Clean.
+    # --------------------------------------------------------
+
+    cleaned, changes, statistics = clean_document(
+        original
+    )
+
+    cleaned_validation = validate_document(
+        cleaned
+    )
+
+    # --------------------------------------------------------
+    # Verify structural preservation.
+    # --------------------------------------------------------
+
+    if original_validation != cleaned_validation:
+
+        raise RuntimeError(
+            "تغيرت بنية الملف أو وسوم الصفحات أثناء التنظيف."
+        )
+
+    # Metadata header must remain identical.
+    original_header = original.split(
+        "#META#Header#End#", 1
+    )[0]
+
+    cleaned_header = cleaned.split(
+        "#META#Header#End#", 1
+    )[0]
+
+    if original_header != cleaned_header:
+
+        raise RuntimeError(
+            "تغيرت البيانات الوصفية، تم إيقاف العملية."
+        )
+
+    # --------------------------------------------------------
+    # Write cleaned document.
+    # --------------------------------------------------------
+
+    write_text(
+        destination_path,
+        cleaned
+    )
+
+    # --------------------------------------------------------
+    # Write changes log.
+    # --------------------------------------------------------
+
+    changes_path = (
+        OUTPUT_DIR
+        / "cleaning_changes.jsonl"
+    )
+
+    with changes_path.open(
+        "w",
+        encoding="utf-8",
+        newline="\n"
+    ) as f:
+
+        for change in changes:
+
+            f.write(
+                json.dumps(
+                    change,
+                    ensure_ascii=False
+                ) + "\n"
+            )
+
+    # --------------------------------------------------------
+    # Report.
+    # --------------------------------------------------------
+
+    report = {
+        "operation": "OpenITI Arabic light normalization",
+        "library": "OpenITI",
+        "function": "openiti.helper.ara.normalize_ara_light",
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+
+        "source_file": str(source_path),
+        "output_file": str(destination_path),
+
+        "source_sha256": sha256_text(original),
+        "cleaned_sha256": sha256_text(cleaned),
+
+        "options": OPTIONS,
+
+        "statistics": statistics,
+
+        "changes_count": len(changes),
+
+        "changes_log": changes_path.name,
+
+        "examples": changes[:MAX_EXAMPLES],
+
+        "validation": {
+            "original": original_validation,
+            "cleaned": cleaned_validation,
+            "metadata_preserved": True,
+            "page_structure_preserved": True,
+            "original_modified": False,
+        },
+
+        "limitations": [
+            "No OCR spelling correction was performed.",
+            "No names of tribes or places were inferred.",
+            "No words were deleted based on confidence.",
+            "No empty pages were deleted.",
+            "No numbers were intentionally removed.",
+            "Search Text was not merged into the primary text.",
+            "Only OpenITI paragraph text lines were normalized.",
+        ],
+    }
+
+    report_path = (
+        OUTPUT_DIR
+        / "cleaning_report.json"
+    )
+
+    write_json(
+        report_path,
+        report
+    )
+
+    # --------------------------------------------------------
+    # Final output.
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 68)
+    print("اكتمل التنظيف بنجاح")
+    print("=" * 68)
+
+    print(
+        f"إجمالي الأسطر: "
+        f"{statistics['total_lines']}"
+    )
+
+    print(
+        f"أسطر النص: "
+        f"{statistics['text_lines']}"
+    )
+
+    print(
+        f"الأسطر التي تغيرت: "
+        f"{statistics['changed_lines']}"
+    )
+
+    print(
+        f"الأسطر دون تغيير: "
+        f"{statistics['unchanged_lines']}"
+    )
+
+    print(
+        f"وسوم الصفحات: "
+        f"{statistics['page_markers']}"
+    )
+
+    print(
+        f"الأسطر الفارغة: "
+        f"{statistics['empty_lines']}"
+    )
+
+    print("\nالملفات الناتجة:")
+
+    print(f"النص المنظف: {destination_path}")
+    print(f"سجل التغييرات: {changes_path}")
+    print(f"تقرير التنظيف: {report_path}")
+
+    print("\nالتحقق البنيوي: ناجح")
+    print("الملف الأصلي: لم يتم تعديله")
+
+
+if __name__ == "__main__":
+
+    try:
+        main()
+
+    except Exception as exc:
+
+        print("\nفشل التنظيف:")
+        print(exc)
+
+        sys.exit(1)
+
+
+================================================================================
+FILE: validate_all_offsets.py
+================================================================================
+
+import json
+from pathlib import Path
+
+BASE = Path("volume_01/extracted")
+
+INDEX_FILE = BASE / "معجم البلدان والقبائل اليمنية المجلد 1_hocr_pageindex.json"
+SEARCH_FILE = BASE / "معجم البلدان والقبائل اليمنية المجلد 1_hocr_searchtext.txt"
+
+index = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+search_text = SEARCH_FILE.read_text(encoding="utf-8")
+
+errors = []
+empty_pages = []
+valid_pages = 0
+total_chars = 0
+
+print("=" * 65)
+print("التحقق الشامل من حدود الصفحات")
+print("=" * 65)
+
+for page_no, record in enumerate(index):
+    start, end = record[0], record[1]
+
+    if not (0 <= start <= end <= len(search_text)):
+        errors.append({
+            "page": page_no,
+            "start": start,
+            "end": end,
+            "reason": "حدود خارج نطاق الملف"
+        })
+        continue
+
+    page_text = search_text[start:end]
+
+    valid_pages += 1
+    total_chars += len(page_text)
+
+    if not page_text.strip():
+        empty_pages.append(page_no)
+
+print("عدد سجلات Page Index:", len(index))
+print("طول Search Text:", len(search_text))
+print("الصفحات ذات الحدود الصحيحة:", valid_pages)
+print("إجمالي المحارف الموزعة:", total_chars)
+print("الصفحات الفارغة:", len(empty_pages))
+print("أرقام الصفحات الفارغة:", empty_pages)
+print("الأخطاء:", len(errors))
+
+if errors:
+    print("\nتفاصيل الأخطاء:")
+    for error in errors[:20]:
+        print(error)
+
+print("\n" + "=" * 65)
+
+if not errors and valid_pages == len(index):
+    print("نجاح: جميع حدود الصفحات تقع داخل Search Text.")
+else:
+    print("تحذير: توجد حدود تحتاج إلى مراجعة.")
+
+print("=" * 65)
+
+# عرض عينات من الصفحات الأخيرة
+print("\nعينات الصفحات الأخيرة:")
+
+for page_no in range(max(0, len(index) - 3), len(index)):
+    start, end = index[page_no][:2]
+    sample = search_text[start:end]
+
+    print(f"\nالصفحة {page_no}")
+    print(f"الحدود: {start} -> {end}")
+    print(repr(sample[:250]))
+
+
+================================================================================
+FILE: validate_page_index.py
+================================================================================
+
+import json
+from pathlib import Path
+
+BASE = Path("volume_01/extracted")
+
+INDEX = BASE / "معجم البلدان والقبائل اليمنية المجلد 1_hocr_pageindex.json"
+
+FULLTEXT = BASE / "معجم البلدان والقبائل اليمنية المجلد 1_djvu.txt"
+
+SEARCHTEXT = BASE / "معجم البلدان والقبائل اليمنية المجلد 1_hocr_searchtext.txt"
+
+index = json.loads(
+    INDEX.read_text(encoding="utf-8")
+)
+
+files = {
+    "Full Text": FULLTEXT,
+    "Search Text": SEARCHTEXT
+}
+
+for label, path in files.items():
+
+    if not path.exists():
+        print(f"\n{label}: الملف غير موجود")
+        continue
+
+    raw = path.read_bytes()
+
+    text = raw.decode(
+        "utf-8",
+        errors="replace"
+    )
+
+    print("\n" + "=" * 65)
+    print(label)
+    print("=" * 65)
+
+    print("عدد البايتات:", len(raw))
+    print("عدد المحارف:", len(text))
+
+    print("\nاختبار أول خمس صفحات:")
+
+    for page_no, record in enumerate(index[:5]):
+
+        start, end = record[0], record[1]
+
+        print(f"\nالصفحة: {page_no}")
+        print(f"الحدود: {start} -> {end}")
+
+        # الاختبار الأول: إزاحات المحارف
+        char_sample = text[start:end]
+
+        print("\n[باستخدام إزاحات المحارف]")
+        print(repr(char_sample[:300]))
+
+        # الاختبار الثاني: إزاحات البايتات
+        byte_sample = raw[start:end].decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        print("\n[باستخدام إزاحات البايتات]")
+        print(repr(byte_sample[:300]))
+
+        print("-" * 50)
+
+print("\nانتهى الاختبار.")
